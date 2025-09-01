@@ -1,31 +1,18 @@
-FROM node:18-alpine
+# Reliable base with Debian + apt
+FROM node:20-bookworm-slim
 
-# Install system dependencies
-RUN apk add --no-cache \
-    ffmpeg \
-    python3 \
-    py3-pip
+# Install ffmpeg + yt-dlp (binary)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+ && chmod a+rx /usr/local/bin/yt-dlp
 
-# Set working directory
 WORKDIR /app
-
-# Copy package files
 COPY package*.json ./
-
-# Install Node.js dependencies
-RUN npm install
-
-# Copy entire project
+RUN npm ci --omit=dev
 COPY . .
 
-# Create downloads directory
-RUN mkdir -p /app/downloads
-
-# Expose port
-EXPOSE 8080
-
-# Environment variable
-ENV PORT=8080
-
-# Start command
-CMD ["npm", "start"]
+ENV NODE_ENV=production
+# Cloud Run injects PORT; we just honor it in server.js
+CMD ["node", "server.js"]

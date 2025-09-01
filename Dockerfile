@@ -1,4 +1,3 @@
-# Use a more robust base image
 FROM node:18-alpine
 
 # Install system dependencies
@@ -6,7 +5,7 @@ RUN apk add --no-cache \
     ffmpeg \
     python3 \
     py3-pip \
-    && pip3 install youtube-dl
+    py3-youtube-dl
 
 # Set working directory
 WORKDIR /app

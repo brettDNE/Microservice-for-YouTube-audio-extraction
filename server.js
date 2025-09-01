@@ -9,17 +9,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Ensure absolute path for downloads
+const outputDir = path.join(process.cwd(), 'downloads');
+
+// Ensure download directory exists
+if (!fs.existsSync(outputDir)){
+  fs.mkdirSync(outputDir, { recursive: true });
+}
+
 app.post('/extract-audio', async (req, res) => {
   try {
     const { videoId } = req.body;
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const outputDir = './downloads';
     
-    // Ensure download directory exists
-    if (!fs.existsSync(outputDir)){
-      fs.mkdirSync(outputDir);
-    }
-
     const videoFilePath = path.join(outputDir, `${videoId}.mp4`);
     const audioFilePath = path.join(outputDir, `${videoId}.mp3`);
 
@@ -47,7 +49,6 @@ app.post('/extract-audio', async (req, res) => {
       audioUrl: `/downloads/${path.basename(audioFilePath)}`,
       videoId: videoId
     });
-
   } catch (error) {
     console.error('Audio extraction error:', error);
     res.status(500).json({ 
@@ -58,9 +59,9 @@ app.post('/extract-audio', async (req, res) => {
 });
 
 // Serve downloaded files
-app.use('/downloads', express.static('downloads'));
+app.use('/downloads', express.static(outputDir));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Audio extraction service running on port ${PORT}`);
 });

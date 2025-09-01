@@ -9,7 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Ensure absolute path for downloads
 const outputDir = path.join(process.cwd(), 'downloads');
 
 // Ensure download directory exists

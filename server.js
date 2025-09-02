@@ -9,7 +9,7 @@ import path from 'path';
 const PORT = process.env.PORT || 8080;
 const app = express();
 
-// --- CORS (so you can call it from browser JS) ---
+// --- CORS ---
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -37,39 +37,61 @@ function cleanup(p) {
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    let stderr = '';
-    let stdout = '';
+    let out = '', err = '';
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    p.stdout.on('data', d => (stdout += d.toString()));
-    p.stderr.on('data', d => (stderr += d.toString()));
+    const keep = (buf, chunk) => {
+      buf += chunk.toString();
+      return buf.length > 4096 ? buf.slice(-4096) : buf;
+    };
+    p.stdout.on('data', d => { out = keep(out, d); });
+    p.stderr.on('data', d => { err = keep(err, d); });
     p.on('error', reject);
     p.on('exit', code => {
-      if (code === 0) return resolve({ stdout, stderr });
-      const err = new Error(`${cmd} exited ${code}`);
-      err.code = code;
-      err.stderr = stderr;
-      err.stdout = stdout;
-      reject(err);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`${cmd} exited ${code}\n--- stdout ---\n${out}\n--- stderr ---\n${err}`));
     });
   });
 }
 
 function buildYtDlpArgs({ url, format, outBase, cookiesPath }) {
+  // Use a stable desktop Chrome UA (or override with env YTDLP_UA)
+  const UA = process.env.YTDLP_UA ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+  const extractorArgs = [
+    '--user-agent', UA,
+    '--add-header', 'Referer:https://www.youtube.com/',
+    '--add-header', 'Origin:https://www.youtube.com',
+    '--extractor-args', 'youtube:player_client=web'
+  ];
+
+  const retryArgs = [
+    '--sleep-requests','1',
+    '--retries','8',
+    '--fragment-retries','8',
+    '--concurrent-fragments','1'
+  ];
+
+  const formatSelector = 'bestaudio* / bestaudio / best';
+
   const args = [
     '-v',
-    '--no-cache-dir',
-    '--rm-cache-dir',
+    '--no-cache-dir', '--rm-cache-dir',
     '--restrict-filenames',
     '--force-ipv4',
     '--geo-bypass',
     '--no-playlist',
+    '--match-filter', '!is_live',
     '-x', '--audio-format', format,
     '-o', outBase,
-    '--extractor-args', 'youtube:player_client=android',
-    '-f', 'bestaudio/best'
+    '-f', formatSelector,
+    ...extractorArgs,
+    ...retryArgs,
+    url
   ];
-  if (cookiesPath) args.push('--cookies', cookiesPath);
-  args.push(url);
+
+  if (cookiesPath) args.splice(args.length - 1, 0, '--cookies', cookiesPath);
+
   return args;
 }
 
@@ -86,43 +108,48 @@ app.get('/doctor', async (_req, res) => {
     const yv = await run('yt-dlp', ['--version']);
     const fv = await run('ffmpeg', ['-version']);
     res.json({
-      ytdlp_version: (yv.stdout || yv.stderr).split('\n')[0].trim(),
-      ffmpeg_version: (fv.stdout.split('\n')[0] || '').trim(),
+      ytdlp_version: (yv.out || yv.err).split('\n')[0].trim(),
+      ffmpeg_version: (fv.out.split('\n')[0] || '').trim(),
       writable_tmp: fs.existsSync('/tmp')
     });
   } catch (e) {
-    res.status(500).json({ error: e.message, detail: (e.stderr || '').slice(-2000) });
+    res.status(500).json({ error: e.message });
   }
 });
 
 app.get('/extract', async (req, res) => {
   try {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'Missing ?url' });
+    const rawUrl = req.query.url;
+    if (!rawUrl) return res.status(400).json({ error: 'Missing ?url' });
 
-    const format = (req.query.format || 'mp3').toLowerCase(); // mp3|wav
+    const format = (req.query.format || 'mp3').toLowerCase();
     const upload = String(req.query.upload || 'false') === 'true';
     const debug = String(req.query.debug || '0') === '1';
 
     const outBase = path.join('/tmp', '%(id)s.%(ext)s');
 
-    // Optional: write cookies to /tmp if provided via env/secret
+    // Write cookies if provided
     let cookiesPath = '';
     if (COOKIES_RAW) {
-      try {
-        cookiesPath = path.join('/tmp', `cookies_${Date.now()}.txt`);
-        fs.writeFileSync(cookiesPath, COOKIES_RAW, { mode: 0o600 });
-      } catch (e) {
-        console.warn('Failed to write cookies file:', e);
-      }
+      cookiesPath = path.join('/tmp', `cookies_${Date.now()}.txt`);
+      fs.writeFileSync(cookiesPath, COOKIES_RAW, { mode: 0o600 });
     }
 
-    // Run yt-dlp
-    const args = buildYtDlpArgs({ url, format, outBase, cookiesPath });
-    const result = await run('yt-dlp', args);
-    if (debug) console.log(result.stderr || result.stdout);
+    const args = buildYtDlpArgs({ url: rawUrl, format, outBase, cookiesPath });
 
-    // Find the most recent produced file in /tmp
+    try {
+      const result = await run('yt-dlp', args);
+      if (debug) console.log(result.err || result.out);
+    } catch (err) {
+      if (cookiesPath) cleanup(cookiesPath);
+      return res.status(500).json({
+        error: 'yt-dlp exited 1',
+        hint: 'If detail shows LOGIN_REQUIRED, refresh cookies from youtube.com + google.com + accounts.google.com and redeploy.',
+        detail: err.message || String(err)
+      });
+    }
+
+    // Pick the most recent file
     const candidates = fs.readdirSync('/tmp').filter(f => f.toLowerCase().endsWith(`.${format}`));
     if (!candidates.length) {
       if (cookiesPath) cleanup(cookiesPath);
@@ -130,26 +157,24 @@ app.get('/extract', async (req, res) => {
     }
     candidates.sort((a, b) => fs.statSync(path.join('/tmp', b)).mtimeMs - fs.statSync(path.join('/tmp', a)).mtimeMs);
     const filePath = path.join('/tmp', candidates[0]);
-
-    // Force a friendly download filename when streaming
     const fileName = path.basename(filePath);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    res.setHeader('Content-Type', format === 'mp3' ? 'audio/mpeg' : 'audio/wav');
 
+    // If upload requested
     if (upload && storage && BUCKET) {
-      const destName = fileName;
-      await storage.bucket(BUCKET).upload(filePath, { destination: destName, resumable: false });
-      const [signedUrl] = await storage.bucket(BUCKET).file(destName).getSignedUrl({
+      await storage.bucket(BUCKET).upload(filePath, { destination: fileName, resumable: false });
+      const [signedUrl] = await storage.bucket(BUCKET).file(fileName).getSignedUrl({
         version: 'v4',
         action: 'read',
-        expires: Date.now() + 15 * 60 * 1000 // 15 minutes
+        expires: Date.now() + 15 * 60 * 1000
       });
       cleanup(filePath);
       if (cookiesPath) cleanup(cookiesPath);
-      return res.json({ bucket: BUCKET, object: destName, url: signedUrl });
+      return res.json({ bucket: BUCKET, object: fileName, url: signedUrl });
     }
 
-    // Stream back directly
+    // Otherwise stream back
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Type', format === 'mp3' ? 'audio/mpeg' : 'audio/wav');
     const stream = fs.createReadStream(filePath);
     stream.on('close', () => {
       cleanup(filePath);
@@ -158,11 +183,7 @@ app.get('/extract', async (req, res) => {
     stream.pipe(res);
 
   } catch (err) {
-    console.error(err.stderr || err);
-    return res.status(500).json({
-      error: String(err.message || err),
-      detail: req.query.debug === '1' ? (err.stderr || '').slice(-5000) : undefined
-    });
+    return res.status(500).json({ error: String(err.message || err) });
   }
 });
 
